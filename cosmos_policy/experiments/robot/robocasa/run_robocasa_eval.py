@@ -129,6 +129,7 @@ TASK_MAX_STEPS = {
     # Drawer tasks
     "OpenDrawer": 500,
     "CloseDrawer": 500,
+    "PnPDrawerToCounter": 600,
     # Stove tasks
     "TurnOnStove": 500,
     "TurnOffStove": 500,
@@ -145,8 +146,10 @@ TASK_MAX_STEPS = {
     "PnPRoboarmCosmosChain3": 2000,
     "PnPRoboarmCosmosChain2MicrowaveCloseOn": 1000,
     "PnPRoboarmCosmosChain2DrawerOpenClose": 1000,
+    "PnPRoboarmCosmosChain3DrawerPotatoOpenPnPClose": 2000,
     "PnPRoboarmCosmosChain4MicrowaveCloseOnOffOpen": 2000,
     "PnPRoboarmCosmosChain6PotatoMwPlate": 4500,
+    "PnPRoboarmCosmosChainRecipeStoveMwV1": 6500,
     "TurnOffMicrowave": 500,
 }
 
@@ -157,8 +160,10 @@ _KITCHEN_ROBOARM_COSMOS_CHAIN_TASKS = frozenset(
         "PnPRoboarmCosmosChain3",
         "PnPRoboarmCosmosChain2MicrowaveCloseOn",
         "PnPRoboarmCosmosChain2DrawerOpenClose",
+        "PnPRoboarmCosmosChain3DrawerPotatoOpenPnPClose",
         "PnPRoboarmCosmosChain4MicrowaveCloseOnOffOpen",
         "PnPRoboarmCosmosChain6PotatoMwPlate",
+        "PnPRoboarmCosmosChainRecipeStoveMwV1",
     }
 )
 
@@ -401,6 +406,19 @@ def create_robocasa_env(cfg: PolicyEvalConfig, seed=None, episode_idx=None):
         env_kwargs["obj_groups"] = str(cfg.obj_groups).strip()
     env = robosuite.make(**env_kwargs)
     return env, env_kwargs
+
+
+def _snapshot_future_image_predictions(fp: dict | None) -> dict | None:
+    """Copy decoded future-image dict so later model steps cannot overwrite buffers (fixes black bottom row in MP4)."""
+    if fp is None:
+        return None
+    out: dict = {}
+    for k, v in fp.items():
+        if isinstance(v, np.ndarray):
+            out[k] = np.array(v, copy=True, order="C")
+        else:
+            out[k] = v
+    return out
 
 
 def run_episode(
@@ -772,7 +790,7 @@ def run_episode(
             best_value_predictions = best_return_dict[2]
             # Use the best actions, future predictions, and value predictions found
             action_queue.extend(best_actions)
-            future_image_predictions_list.append(best_future_predictions)
+            future_image_predictions_list.append(_snapshot_future_image_predictions(best_future_predictions))
             log_message(f"t={t}: Selected seed {best_seed} with value = {best_value_predictions:.4f}", log_file)
 
         # Get next action from chunk
