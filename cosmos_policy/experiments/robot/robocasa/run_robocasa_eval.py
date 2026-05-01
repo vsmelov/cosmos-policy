@@ -149,6 +149,17 @@ TASK_MAX_STEPS = {
     "TurnOffMicrowave": 500,
 }
 
+# Environments defined in kitchen-roboarm fork (``robocasa/.../custom/kitchen_roboarm_cosmos_chain3.py``);
+# not listed in ``dataset_registry`` MimicGen paths — still valid for ``robosuite.make``.
+_KITCHEN_ROBOARM_COSMOS_CHAIN_TASKS = frozenset(
+    {
+        "PnPRoboarmCosmosChain3",
+        "PnPRoboarmCosmosChain2MicrowaveCloseOn",
+        "PnPRoboarmCosmosChain2DrawerOpenClose",
+        "PnPRoboarmCosmosChain4MicrowaveCloseOnOffOpen",
+    }
+)
+
 
 @dataclass
 class PolicyEvalConfig:
@@ -258,17 +269,19 @@ def validate_config(cfg: PolicyEvalConfig) -> None:
     all_tasks = {**SINGLE_STAGE_TASK_DATASETS, **MULTI_STAGE_TASK_DATASETS}
     chain = _parse_task_chain(cfg)
     if chain:
+        allowed = set(all_tasks) | _KITCHEN_ROBOARM_COSMOS_CHAIN_TASKS
         for t in chain:
-            if t not in all_tasks:
+            if t not in allowed:
                 raise ValueError(
-                    f"task_chain contains unknown task '{t}'. Available tasks: {list(all_tasks.keys())}"
+                    f"task_chain contains unknown task '{t}'. Available tasks: {sorted(allowed)}"
                 )
         if cfg.use_parallel_inference:
             raise ValueError("task_chain is not supported together with use_parallel_inference")
         return
-    if cfg.task_name not in all_tasks:
+    if cfg.task_name not in all_tasks and cfg.task_name not in _KITCHEN_ROBOARM_COSMOS_CHAIN_TASKS:
+        allowed = sorted(set(all_tasks) | _KITCHEN_ROBOARM_COSMOS_CHAIN_TASKS)
         raise ValueError(
-            f"Task name '{cfg.task_name}' not found in RoboCasa suite. Available tasks: {list(all_tasks.keys())}"
+            f"Task name '{cfg.task_name}' not found in RoboCasa suite. Available tasks: {allowed}"
         )
 
     # Check that num_third_person_images is 2 (1 for left, 1 for right)
