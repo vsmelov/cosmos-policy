@@ -24,6 +24,8 @@ Env:
   COSMOS_SEQ_STAGE_RETRIES   max tries per stage (default 3)
   COSMOS_SEQ_MASTER_SEED     optional int for np.random.default_rng ([0,max) for base seeds)
   COSMOS_SEQ_SAVE_MUJOCO_CHECKPOINTS  если 1/true: в ``run_NNN/`` пишутся ``mujoco_checkpoint__after_reset_chain_stage_00.npz``, ``mujoco_checkpoint__after_stageKK_success_chain_stage_JJ.npz``, ``…_terminal`` (+ ``outer_episode_idx`` для ``create_robocasa_env(..., episode_idx=…)``); алиасы: chain4 после start — ``chain4_after_start_success.npz``; chain6 — ``chain6_after_start_success.npz`` (перед стадией stop)
+  COSMOS_SEQ_HOTSTART_NPZ           путь к .npz (как после успешной стадии K); ``COSMOS_SEQ_HOTSTART_FIRST_STAGE`` = индекс первой стадии цикла (напр. 3 = сразу TurnOff)
+  COSMOS_SEQ_HOTSTART_ALL_RUNS      если 1: каждый outer run начинается с hotstart (иначе только ``run_000``)
   COSMOS_SEQ_CONSOLE_LOG     если 0/false/no — не дублировать ключевые строки в stderr контейнера (по умолчанию: дублировать)
 
 Invoked like cosmos_sequential_one_reset_chain.py (same PolicyEvalConfig / docker bash block).
@@ -86,6 +88,20 @@ def _snapshot_for_checkpoint(env: Any, outer_episode_idx: int) -> dict[str, Any]
     snap = _env_snapshot(env)
     snap["outer_episode_idx"] = int(outer_episode_idx)
     return snap
+
+
+def _read_hotstart_npz(npz_path: str) -> tuple[dict[str, Any], int | None, int | None]:
+    """Load ``sim_flat`` + ``chain_stage`` (+ optional ``run_seed_layout``, ``outer_episode_idx``) from saved .npz."""
+    zf = np.load(npz_path, allow_pickle=False)
+    snap: dict[str, Any] = {
+        "sim_flat": np.asarray(zf["sim_flat"], dtype=np.float64).copy(),
+        "chain_stage": int(np.asarray(zf["chain_stage"]).reshape(())),
+    }
+    if "microwave_turned_on" in zf.files:
+        snap["microwave_turned_on"] = bool(np.asarray(zf["microwave_turned_on"]).reshape(()))
+    rs = int(np.asarray(zf["run_seed_layout"]).reshape(())) if "run_seed_layout" in zf.files else None
+    ep = int(np.asarray(zf["outer_episode_idx"]).reshape(())) if "outer_episode_idx" in zf.files else None
+    return snap, rs, ep
 
 
 def _env_restore(env: Any, snap: dict[str, Any]) -> None:
@@ -298,6 +314,22 @@ def _run_episode_with_heartbeat(lf_run: Any, label: str, fn: Any) -> Any:
 def main_with_cfg(cfg: PolicyEvalConfig) -> int:
     num_stages, stage_horizon_names = resolve_chain_stages(cfg.task_name)
 
+    hot_npz = os.environ.get("COSMOS_SEQ_HOTSTART_NPZ", "").strip()
+    hot_first_raw = os.environ.get("COSMOS_SEQ_HOTSTART_FIRST_STAGE", "").strip()
+    hot_first: int | None = int(hot_first_raw) if hot_first_raw != "" else None
+    hot_all = os.environ.get("COSMOS_SEQ_HOTSTART_ALL_RUNS", "").strip().lower() in ("1", "true", "yes")
+    hot_snap: dict[str, Any] | None = None
+    hot_rs: int | None = None
+    hot_ep: int | None = None
+    if hot_npz:
+        if hot_first is None:
+            print(
+                "cosmos_sequential_chain_retries: set COSMOS_SEQ_HOTSTART_FIRST_STAGE (e.g. 3) with COSMOS_SEQ_HOTSTART_NPZ",
+                file=sys.stderr,
+            )
+            return 2
+        hot_snap, hot_rs, hot_ep = _read_hotstart_npz(hot_npz)
+
     chain_runs = int(os.environ.get("COSMOS_SEQ_CHAIN_RUNS", "10"))
     stage_retries = int(os.environ.get("COSMOS_SEQ_STAGE_RETRIES", "3"))
     master_seed_raw = os.environ.get("COSMOS_SEQ_MASTER_SEED", "").strip()
@@ -334,6 +366,9 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
         "stage_horizon_names": list(stage_horizon_names),
         "policy_cfg_seed_field": cfg.seed,
         "layout_and_style_ids": cfg.layout_and_style_ids,
+        "hotstart_npz": hot_npz or None,
+        "hotstart_first_stage": hot_first,
+        "hotstart_all_runs": bool(hot_all),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2))
 
@@ -388,7 +423,16 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
     )
 
     for irun in range(chain_runs):
-        run_seed_base = int(rng.integers(0, 2**31 - 1))
+        use_hot_now = hot_snap is not None and (irun == 0 or hot_all)
+        if use_hot_now:
+            run_seed_base = int(hot_rs) if hot_rs is not None else int(rng.integers(0, 2**31 - 1))
+            ep_idx = int(hot_ep) if hot_ep is not None else irun
+            stage0 = int(hot_first)  # type: ignore[arg-type]
+        else:
+            run_seed_base = int(rng.integers(0, 2**31 - 1))
+            ep_idx = irun
+            stage0 = 0
+
         run_dir = base_log_path / f"run_{irun:03d}"
         run_dir.mkdir(parents=True, exist_ok=True)
         run_rollout_primary: list = []
@@ -415,7 +459,7 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
         _timeline(f"run_{irun:03d}_start spawn_seed≈{run_seed_base}")
 
         t_env = time.perf_counter()
-        env, _ = create_robocasa_env(cfg, seed=run_seed_base, episode_idx=irun)
+        env, _ = create_robocasa_env(cfg, seed=run_seed_base, episode_idx=ep_idx)
         if cfg.deterministic_reset:
             rs = cfg.deterministic_reset_seed if cfg.deterministic_reset_seed is not None else cfg.seed
             set_seed_everywhere(rs)
@@ -423,6 +467,20 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
             _orc_log(lf_run, f"deterministic_reset=False (env stochasticity может отличаться от ожиданий).")
 
         env.reset()
+        if use_hot_now:
+            assert hot_snap is not None and hot_first is not None
+            _env_restore(env, hot_snap)
+            if int(env.chain_stage) != int(hot_first):
+                raise RuntimeError(
+                    f"hotstart: env.chain_stage={env.chain_stage} != COSMOS_SEQ_HOTSTART_FIRST_STAGE={hot_first} "
+                    f"(npz={hot_npz!r})"
+                )
+            _orc_log(
+                lf_run,
+                f"hotstart MuJoCo from {hot_npz!r} | first_stage={stage0} | layout_seed={run_seed_base} | "
+                f"episode_idx={ep_idx} | chain_stage={int(getattr(env, 'chain_stage'))}",
+                stderr_too=True,
+            )
         checkpoint_before_stage = _snapshot_for_checkpoint(env, irun)
         try:
             _write_run_initial_scene(run_dir, env, run_seed_base=run_seed_base, cfg=cfg)
@@ -435,18 +493,19 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
             f"Mujoco_flat_state_bytes≈{int(checkpoint_before_stage['sim_flat'].nbytes)}",
             stderr_too=True,
         )
+        _ck0_tag = f"after_hotstart_chain_stage_{stage0:02d}" if use_hot_now else "after_reset_chain_stage_00"
         _save_mujoco_checkpoint_npz(
             run_dir,
             checkpoint_before_stage,
             lf_run,
-            "after_reset_chain_stage_00",
+            _ck0_tag,
             run_seed_layout=run_seed_base,
         )
 
         run_ok = True
         stage_records: list[dict[str, Any]] = []
 
-        for stage_idx in range(num_stages):
+        for stage_idx in range(stage0, num_stages):
             assert env.chain_stage == stage_idx
             horizon_name = stage_horizon_names[stage_idx]
             max_steps_horizon = TASK_MAX_STEPS.get(horizon_name, 500)
@@ -712,6 +771,9 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
             "run_seed_layout": run_seed_base,
             "run_all_stages_success": run_ok,
             "stages": stage_records,
+            "hotstart_npz": hot_npz if use_hot_now else None,
+            "hotstart_first_stage": int(hot_first) if use_hot_now and hot_first is not None else None,
+            "episode_idx": ep_idx,
         }
         (run_dir / "run_meta.json").write_text(json.dumps(run_summary, indent=2))
         _orc_log(
