@@ -18,6 +18,7 @@ Then copy ``run_000/chain4_after_start_success.npz`` from that experiment into a
 
 ``COSMOS_CHAIN4_CHECKPOINT_LAYOUT_SEED`` must match ``create_robocasa_env(..., seed=...)`` used when the checkpoint
 was recorded, otherwise ``reset()`` layout can diverge before ``set_state_from_flattened``.
+Optional: ``COSMOS_CHAIN4_CHECKPOINT_EPISODE_IDX`` or ``outer_episode_idx`` in the .npz for ``create_robocasa_env(..., episode_idx=...)``.
 """
 
 import os
@@ -95,7 +96,14 @@ def main(cfg: PolicyEvalConfig) -> int:
         layout_seed = int(np.asarray(zf["run_seed_layout"]).reshape(()))
     else:
         layout_seed = int(cfg.seed)
-    env, _ = create_robocasa_env(cfg, seed=layout_seed, episode_idx=0)
+    ep_raw = os.environ.get("COSMOS_CHAIN4_CHECKPOINT_EPISODE_IDX", "").strip()
+    if ep_raw:
+        episode_idx = int(ep_raw)
+    elif "outer_episode_idx" in zf.files:
+        episode_idx = int(np.asarray(zf["outer_episode_idx"]).reshape(()))
+    else:
+        episode_idx = 0
+    env, _ = create_robocasa_env(cfg, seed=layout_seed, episode_idx=episode_idx)
     if cfg.deterministic_reset:
         rs = cfg.deterministic_reset_seed if cfg.deterministic_reset_seed is not None else cfg.seed
         set_seed_everywhere(rs)

@@ -23,7 +23,7 @@ Env:
   COSMOS_SEQ_CHAIN_RUNS       outer loop count (default 10)
   COSMOS_SEQ_STAGE_RETRIES   max tries per stage (default 3)
   COSMOS_SEQ_MASTER_SEED     optional int for np.random.default_rng ([0,max) for base seeds)
-  COSMOS_SEQ_SAVE_MUJOCO_CHECKPOINTS  если 1/true: в ``run_NNN/`` пишутся ``mujoco_checkpoint__after_reset_chain_stage_00.npz``, ``mujoco_checkpoint__after_stageKK_success_chain_stage_JJ.npz``, ``…_terminal``; для chain4 дублируется ``chain4_after_start_success.npz`` после успешного start
+  COSMOS_SEQ_SAVE_MUJOCO_CHECKPOINTS  если 1/true: в ``run_NNN/`` пишутся ``mujoco_checkpoint__after_reset_chain_stage_00.npz``, ``mujoco_checkpoint__after_stageKK_success_chain_stage_JJ.npz``, ``…_terminal`` (+ ``outer_episode_idx`` для ``create_robocasa_env(..., episode_idx=…)``); алиасы: chain4 после start — ``chain4_after_start_success.npz``; chain6 — ``chain6_after_start_success.npz`` (перед стадией stop)
   COSMOS_SEQ_CONSOLE_LOG     если 0/false/no — не дублировать ключевые строки в stderr контейнера (по умолчанию: дублировать)
 
 Invoked like cosmos_sequential_one_reset_chain.py (same PolicyEvalConfig / docker bash block).
@@ -81,6 +81,13 @@ def _env_snapshot(env: Any) -> dict[str, Any]:
     return out
 
 
+def _snapshot_for_checkpoint(env: Any, outer_episode_idx: int) -> dict[str, Any]:
+    """MuJoCo snapshot + metadata for .npz reload (layout scene index = outer run index)."""
+    snap = _env_snapshot(env)
+    snap["outer_episode_idx"] = int(outer_episode_idx)
+    return snap
+
+
 def _env_restore(env: Any, snap: dict[str, Any]) -> None:
     sim = env.sim
     flat = snap["sim_flat"]
@@ -132,6 +139,8 @@ def _save_mujoco_checkpoint_npz(
         arrays["microwave_turned_on"] = np.asarray(bool(ck["microwave_turned_on"]), dtype=np.bool_)
     if run_seed_layout is not None:
         arrays["run_seed_layout"] = np.int32(int(run_seed_layout))
+    if ck.get("outer_episode_idx") is not None:
+        arrays["outer_episode_idx"] = np.int32(int(ck["outer_episode_idx"]))
     np.savez_compressed(outp, **arrays)
     _orc_log(lf_run, f"saved mujoco checkpoint {outp.name} ({int(arrays['sim_flat'].nbytes)} B sim_flat)", stderr_too=False)
 
@@ -414,7 +423,7 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
             _orc_log(lf_run, f"deterministic_reset=False (env stochasticity может отличаться от ожиданий).")
 
         env.reset()
-        checkpoint_before_stage = _env_snapshot(env)
+        checkpoint_before_stage = _snapshot_for_checkpoint(env, irun)
         try:
             _write_run_initial_scene(run_dir, env, run_seed_base=run_seed_base, cfg=cfg)
         except Exception as e:
@@ -606,7 +615,7 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
                         finally:
                             if hasattr(env, "_chain_arm_home_capture_cb"):
                                 delattr(env, "_chain_arm_home_capture_cb")
-                        checkpoint_before_stage = _env_snapshot(env)
+                        checkpoint_before_stage = _snapshot_for_checkpoint(env, irun)
                         _orc_log(
                             lf_run,
                             f"стадия {stage_idx} SUCCESS → advance_chain_stage OK | "
@@ -632,15 +641,34 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
                                     bool(ck.get("microwave_turned_on", True)), dtype=np.bool_
                                 ),
                                 run_seed_layout=np.int32(int(run_seed_base)),
+                                outer_episode_idx=np.int32(int(irun)),
                             )
                             _orc_log(
                                 lf_run,
                                 f"saved alias for stop-only script: {outp2.name}",
                                 stderr_too=True,
                             )
+                        if cfg.task_name == "PnPRoboarmCosmosChain6PotatoMwPlate" and stage_idx == 2:
+                            outp2 = run_dir / "chain6_after_start_success.npz"
+                            ck = checkpoint_before_stage
+                            np.savez_compressed(
+                                outp2,
+                                sim_flat=np.asarray(ck["sim_flat"], dtype=np.float64),
+                                chain_stage=np.int32(int(ck["chain_stage"])),
+                                microwave_turned_on=np.asarray(
+                                    bool(ck.get("microwave_turned_on", True)), dtype=np.bool_
+                                ),
+                                run_seed_layout=np.int32(int(run_seed_base)),
+                                outer_episode_idx=np.int32(int(irun)),
+                            )
+                            _orc_log(
+                                lf_run,
+                                f"saved alias for chain6 stop-only script: {outp2.name}",
+                                stderr_too=True,
+                            )
                     else:
                         _orc_log(lf_run, "последняя стадия SUCCESS — финиш цепочки.", stderr_too=True)
-                        snap_fin = _env_snapshot(env)
+                        snap_fin = _snapshot_for_checkpoint(env, irun)
                         _save_mujoco_checkpoint_npz(
                             run_dir,
                             snap_fin,
