@@ -35,7 +35,7 @@ from cosmos_policy.experiments.robot.robocasa.run_robocasa_eval import (
     run_episode,
     validate_config,
 )
-from cosmos_policy.experiments.robot.robot_utils import DATE_TIME, log_message, setup_logging
+from cosmos_policy.experiments.robot.robot_utils import log_message, setup_logging
 from cosmos_policy.utils.utils import set_seed_everywhere
 
 
@@ -66,8 +66,8 @@ def _save_stage_rollouts(
     future_image_predictions_list,
     log_file,
 ):
-    slug = f"{stage_idx + 1:03d}_{cfg.task_name}--stage{stage_idx:02d}--{DATE_TIME}"
-    rollout_data_dir = os.path.join(cfg.local_log_dir, "rollout_data", slug)
+    # Videos next to attempt_meta / logs (retry folder), not rollout_data/<long_slug>/.
+    rollout_data_dir = cfg.local_log_dir
     os.makedirs(rollout_data_dir, exist_ok=True)
     save_rollout_video(
         replay_primary_images,

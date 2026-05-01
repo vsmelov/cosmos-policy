@@ -15,7 +15,8 @@ Artifacts (under cfg.local_log_dir, typically …/sequential_retries/<experiment
     stage_<k>/retry_<j>/
       attempt_meta.json                (+ instruction_lang, layout/style id)
       attempt_scene.json               ep_meta (object_cfgs, fixtures, lang, …), cfg, объекты в сцене
-      rollout_data/…
+      *.mp4 (rollout + optional future_pred) в этой же папке
+    run_XXX/full_run_episode--*.mp4   склейка всех стадий + плавный «домой» 1s между стадиями (без future overlay)
       turnoff_stage_debug.log          (chain4, stage «press stop»: JSONL по каждому env.step + summary в конце)
 
 Env:
@@ -53,10 +54,12 @@ from cosmos_policy.experiments.robot.cosmos_utils import (
     init_t5_text_embeddings_cache,
     load_dataset_stats,
 )
+from cosmos_policy.experiments.robot.robocasa.robocasa_utils import save_rollout_video
 from cosmos_policy.experiments.robot.robocasa.run_robocasa_eval import (
     TASK_MAX_STEPS,
     PolicyEvalConfig,
     create_robocasa_env,
+    prepare_observation,
     run_episode,
     validate_config,
 )
@@ -339,6 +342,27 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
         with orc_summ.open("a", encoding="utf-8") as otl:
             otl.write(line)
 
+    def _append_rollout_frame_from_env_robot_obs(
+        env: Any,
+        cfg0: PolicyEvalConfig,
+        rp: list,
+        rs: list,
+        rw: list,
+    ) -> None:
+        """After arm-home ``sim.forward`` substeps, refresh cached obs and append RGB (same layout as run_episode)."""
+        try:
+            obs = env._get_observations()
+        except Exception:
+            return
+        observation = prepare_observation(obs, cfg0.flip_images)
+        pi, si, wi = observation["primary_image"], observation["secondary_image"], observation["wrist_image"]
+        if pi is not None:
+            rp.append(np.array(pi, copy=True, order="C"))
+        if si is not None:
+            rs.append(np.array(si, copy=True, order="C"))
+        if wi is not None:
+            rw.append(np.array(wi, copy=True, order="C"))
+
     global_outcomes: list[dict[str, Any]] = []
 
     if _console_dup_enabled():
@@ -358,6 +382,9 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
         run_seed_base = int(rng.integers(0, 2**31 - 1))
         run_dir = base_log_path / f"run_{irun:03d}"
         run_dir.mkdir(parents=True, exist_ok=True)
+        run_rollout_primary: list = []
+        run_rollout_secondary: list = []
+        run_rollout_wrist: list = []
 
         set_seed_everywhere(cfg.seed)
 
@@ -541,7 +568,7 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
                     future_image_predictions_list,
                     lf_run,
                 )
-                _orc_log(lf_run, f"видеокадры сохранены в {adir.resolve()}/rollout_data/")
+                _orc_log(lf_run, f"видеокадры сохранены в {adir.resolve()}/")
                 _lf_flush(lf_run)
 
                 _em = env.get_ep_meta()
@@ -562,8 +589,18 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
 
                 if success:
                     succeeded = True
+                    run_rollout_primary.extend(replay_primary_images)
+                    run_rollout_secondary.extend(replay_secondary_images)
+                    run_rollout_wrist.extend(replay_wrist_images)
                     if stage_idx < num_stages - 1:
-                        env.advance_chain_stage()
+                        try:
+                            env._chain_arm_home_capture_cb = lambda e: _append_rollout_frame_from_env_robot_obs(
+                                e, cfg, run_rollout_primary, run_rollout_secondary, run_rollout_wrist
+                            )
+                            env.advance_chain_stage()
+                        finally:
+                            if hasattr(env, "_chain_arm_home_capture_cb"):
+                                delattr(env, "_chain_arm_home_capture_cb")
                         checkpoint_before_stage = _env_snapshot(env)
                         _orc_log(
                             lf_run,
@@ -620,6 +657,21 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
                 run_ok = False
                 log_message(f"Run {irun}: abort after stage {stage_idx} exhaustion.", lf_run)
                 break
+
+        if run_ok and run_rollout_primary:
+            try:
+                save_rollout_video(
+                    run_rollout_primary,
+                    run_rollout_secondary,
+                    run_rollout_wrist,
+                    irun,
+                    success=True,
+                    task_description="full_run_episode_including_arm_home",
+                    rollout_data_dir=str(run_dir),
+                    log_file=lf_run,
+                )
+            except Exception as e:
+                _orc_log(lf_run, f"warn: full-run video not saved: {e!r}", stderr_too=False)
 
         env.close()
         run_summary = {

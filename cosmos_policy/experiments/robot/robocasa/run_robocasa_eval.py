@@ -146,6 +146,7 @@ TASK_MAX_STEPS = {
     "PnPRoboarmCosmosChain2MicrowaveCloseOn": 1000,
     "PnPRoboarmCosmosChain2DrawerOpenClose": 1000,
     "PnPRoboarmCosmosChain4MicrowaveCloseOnOffOpen": 2000,
+    "PnPRoboarmCosmosChain6PotatoMwPlate": 4500,
     "TurnOffMicrowave": 500,
 }
 
@@ -157,6 +158,7 @@ _KITCHEN_ROBOARM_COSMOS_CHAIN_TASKS = frozenset(
         "PnPRoboarmCosmosChain2MicrowaveCloseOn",
         "PnPRoboarmCosmosChain2DrawerOpenClose",
         "PnPRoboarmCosmosChain4MicrowaveCloseOnOffOpen",
+        "PnPRoboarmCosmosChain6PotatoMwPlate",
     }
 )
 
