@@ -62,6 +62,7 @@ Usage examples:
 """
 
 import ast
+import dataclasses
 import multiprocessing as mp
 import os
 import pickle
@@ -69,7 +70,7 @@ import secrets
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional, Sequence
 
 import draccus
 import h5py
@@ -141,6 +142,10 @@ TASK_MAX_STEPS = {
     "CoffeePressButton": 300,
     # Microwave tasks
     "TurnOnMicrowave": 500,
+    "PnPRoboarmCosmosChain3": 2000,
+    "PnPRoboarmCosmosChain2MicrowaveCloseOn": 1000,
+    "PnPRoboarmCosmosChain2DrawerOpenClose": 1000,
+    "PnPRoboarmCosmosChain4MicrowaveCloseOnOffOpen": 2000,
     "TurnOffMicrowave": 500,
 }
 
@@ -209,6 +214,7 @@ class PolicyEvalConfig:
     # RoboCasa-specific parameters
     #################################################################################################################
     task_name: str = "PnPCounterToCab"                                   # Task name (must be in SINGLE_STAGE_TASK_DATASETS or MULTI_STAGE_TASK_DATASETS)
+    task_chain: Optional[str] = None                                     # If set (comma-separated task names), run all segments in one process: one model load, sequential env.make per segment (each segment resets its own scene). Docker still only once if the host invokes eval once.
     num_trials_per_task: int = 50                                        # Number of rollouts per task
     env_img_res: int = 224                                               # Resolution for rendering environment images
     robots: str = "PandaMobile"                                          # Robot type for RoboCasa (PandaMobile is alias for PandaOmron)
@@ -216,6 +222,7 @@ class PolicyEvalConfig:
     obj_instance_split: str = "B"                                        # Object instance split - "B" = held-out test objects
     layout_and_style_ids: str = "((1,1),(2,2),(4,4),(6,9),(7,10))"       # Layout and style IDs - 5 test scenes
     randomize_cameras: bool = False                                      # Whether to randomize camera positions
+    obj_groups: Optional[str] = None                                     # RoboCasa PnP: object group (e.g. bowl); None = env default (food)
 
     #################################################################################################################
     # Utils
@@ -239,10 +246,26 @@ class PolicyEvalConfig:
     # fmt: on
 
 
+def _parse_task_chain(cfg: PolicyEvalConfig) -> List[str]:
+    raw = (cfg.task_chain or "").strip()
+    if not raw:
+        return []
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
+
 def validate_config(cfg: PolicyEvalConfig) -> None:
     """Validate that the evaluation configuration is valid."""
-    # Check that the task name is valid
     all_tasks = {**SINGLE_STAGE_TASK_DATASETS, **MULTI_STAGE_TASK_DATASETS}
+    chain = _parse_task_chain(cfg)
+    if chain:
+        for t in chain:
+            if t not in all_tasks:
+                raise ValueError(
+                    f"task_chain contains unknown task '{t}'. Available tasks: {list(all_tasks.keys())}"
+                )
+        if cfg.use_parallel_inference:
+            raise ValueError("task_chain is not supported together with use_parallel_inference")
+        return
     if cfg.task_name not in all_tasks:
         raise ValueError(
             f"Task name '{cfg.task_name}' not found in RoboCasa suite. Available tasks: {list(all_tasks.keys())}"
@@ -354,6 +377,13 @@ def create_robocasa_env(cfg: PolicyEvalConfig, seed=None, episode_idx=None):
         layout_and_style_ids=layout_and_style_ids,
         translucent_robot=False,
     )
+    # Только PnP-среды принимают obj_groups в __init__; иначе robosuite.make падает (напр. TurnOnMicrowave).
+    if (
+        cfg.obj_groups is not None
+        and str(cfg.obj_groups).strip()
+        and str(cfg.task_name).startswith("PnP")
+    ):
+        env_kwargs["obj_groups"] = str(cfg.obj_groups).strip()
     env = robosuite.make(**env_kwargs)
     return env, env_kwargs
 
@@ -368,6 +398,9 @@ def run_episode(
     worker_pool,
     episode_idx: int,
     log_file=None,
+    *,
+    episode_log_index: Optional[int] = None,
+    task_name_for_horizon: Optional[str] = None,
 ):
     """Run a single evaluation episode."""
     # Wait for objects to stabilize
@@ -376,7 +409,8 @@ def run_episode(
         dummy_action = np.zeros(env.action_spec[0].shape)
         obs, _, _, _ = env.step(dummy_action)
     # Get max steps for this task
-    max_steps = TASK_MAX_STEPS.get(cfg.task_name, 500)
+    horizon_name = task_name_for_horizon if task_name_for_horizon is not None else cfg.task_name
+    max_steps = TASK_MAX_STEPS.get(horizon_name, 500)
     # Important variables
     success = False
     episode_length = 0
@@ -404,15 +438,17 @@ def run_episode(
     # Main episode loop
     for t in range(max_steps):
         observation = prepare_observation(obs, cfg.flip_images)
-        # Store replay images for video saving
-        replay_primary_images.append(observation["primary_image"])
-        replay_secondary_images.append(observation["secondary_image"])
-        replay_wrist_images.append(observation["wrist_image"])
+        # Store replay images for video saving (must copy: RoboCasa/MuJoCo often reuse the same
+        # underlying image buffer each step; without copy, later env.step overwrites earlier frames
+        # and the MP4 can turn black after a few good frames when the buffer is cleared or reused.)
+        replay_primary_images.append(np.array(observation["primary_image"], copy=True, order="C"))
+        replay_secondary_images.append(np.array(observation["secondary_image"], copy=True, order="C"))
+        replay_wrist_images.append(np.array(observation["wrist_image"], copy=True, order="C"))
         # Collect data if enabled
         if cfg.data_collection:
-            primary_images_list.append(observation["primary_image"])
-            secondary_images_list.append(observation["secondary_image"])
-            wrist_images_list.append(observation["wrist_image"])
+            primary_images_list.append(np.array(observation["primary_image"], copy=True, order="C"))
+            secondary_images_list.append(np.array(observation["secondary_image"], copy=True, order="C"))
+            wrist_images_list.append(np.array(observation["wrist_image"], copy=True, order="C"))
             proprio_list.append(observation["proprio"])
         # Query policy for new action chunk
         if len(action_queue) == 0:
@@ -745,8 +781,9 @@ def run_episode(
             break
 
     # Log episode result
+    _ep_disp = episode_idx if episode_log_index is None else episode_log_index
     log_message(
-        f"  Episode {episode_idx}: {'SUCCESS' if success else 'FAILURE'} (length: {episode_length})",
+        f"  Episode {_ep_disp}: {'SUCCESS' if success else 'FAILURE'} (length: {episode_length})",
         log_file,
     )
     # Prepare collected data if enabled
@@ -793,6 +830,201 @@ def run_episode(
         future_image_predictions_list,
         collected_data,
     )
+
+
+def run_task_chain(
+    cfg: PolicyEvalConfig,
+    chain_tasks: Sequence[str],
+    model,
+    planning_model,
+    dataset_stats,
+    worker_pool,
+    log_file=None,
+):
+    """Run several RoboCasa tasks in one process (one model load), one env per segment.
+
+    Stock RoboCasa uses a different env class / scene per atomic task, so each segment
+    still does ``robosuite.make`` + ``env.reset()``; rigid-body state cannot carry across
+    segments without a custom merged environment.
+    """
+    log_message(
+        "\nRoboCasa task_chain: one Python process, model loaded once; each segment builds "
+        "its own env (make + reset). Physics does not carry between different task scenes.",
+        log_file,
+    )
+    per_seg_successes: List[List[bool]] = [[] for _ in chain_tasks]
+    per_seg_lengths: List[List[int]] = [[] for _ in chain_tasks]
+    for episode_idx in range(cfg.num_trials_per_task):
+        log_message(f"\nStarting chain episode {episode_idx + 1}/{cfg.num_trials_per_task}...", log_file)
+        if cfg.deterministic or cfg.deterministic_reset:
+            chain_seed = cfg.seed * episode_idx * 256
+        else:
+            chain_seed = None
+        for seg_idx, task_name in enumerate(chain_tasks):
+            log_message(
+                f"\nEvaluating task: {task_name} (chain segment {seg_idx + 1}/{len(chain_tasks)})",
+                log_file,
+            )
+            cfg_seg = dataclasses.replace(cfg, task_name=task_name)
+            env, _env_kwargs = create_robocasa_env(cfg_seg, seed=chain_seed, episode_idx=episode_idx)
+            if cfg_seg.deterministic_reset:
+                reset_seed = (
+                    cfg_seg.deterministic_reset_seed if cfg_seg.deterministic_reset_seed is not None else cfg_seg.seed
+                )
+                set_seed_everywhere(reset_seed)
+            env.reset()
+            task_description = env.get_ep_meta()["lang"]
+            log_message(f"\nTask description: {task_description}", log_file)
+            ep_log_idx = episode_idx * len(chain_tasks) + seg_idx
+            (
+                success,
+                length,
+                replay_primary_images,
+                replay_secondary_images,
+                replay_wrist_images,
+                future_image_predictions_list,
+                collected_data,
+            ) = run_episode(
+                cfg_seg,
+                env,
+                task_description,
+                model,
+                planning_model,
+                dataset_stats,
+                worker_pool,
+                episode_idx,
+                log_file,
+                episode_log_index=ep_log_idx,
+                task_name_for_horizon=task_name,
+            )
+            per_seg_successes[seg_idx].append(success)
+            per_seg_lengths[seg_idx].append(length)
+            # Prefix 001_, 002_, … so rollout_data/ sorts by chain order in file browsers.
+            rollout_data_dir = os.path.join(
+                cfg_seg.local_log_dir,
+                "rollout_data",
+                f"{seg_idx + 1:03d}_{task_name}--seg{seg_idx:02d}--{DATE_TIME}",
+            )
+            os.makedirs(rollout_data_dir, exist_ok=True)
+            save_rollout_video(
+                replay_primary_images,
+                replay_secondary_images,
+                replay_wrist_images,
+                episode_idx,
+                success=success,
+                task_description=task_description,
+                rollout_data_dir=rollout_data_dir,
+                log_file=log_file,
+            )
+            if len(future_image_predictions_list) > 0:
+                future_primary_image_predictions = None
+                future_secondary_image_predictions = None
+                future_wrist_image_predictions = None
+                if (
+                    "future_image" in future_image_predictions_list[0]
+                    and future_image_predictions_list[0]["future_image"] is not None
+                ):
+                    future_primary_image_predictions = [x["future_image"] for x in future_image_predictions_list]
+                if (
+                    "future_image2" in future_image_predictions_list[0]
+                    and future_image_predictions_list[0]["future_image2"] is not None
+                ):
+                    future_secondary_image_predictions = [x["future_image2"] for x in future_image_predictions_list]
+                if (
+                    "future_wrist_image" in future_image_predictions_list[0]
+                    and future_image_predictions_list[0]["future_wrist_image"] is not None
+                ):
+                    future_wrist_image_predictions = [x["future_wrist_image"] for x in future_image_predictions_list]
+                if (
+                    future_primary_image_predictions is not None
+                    and future_secondary_image_predictions is not None
+                    and future_wrist_image_predictions is not None
+                ):
+                    save_rollout_video_with_future_image_predictions(
+                        replay_primary_images,
+                        replay_secondary_images,
+                        replay_wrist_images,
+                        episode_idx,
+                        success=success,
+                        task_description=task_description,
+                        rollout_data_dir=rollout_data_dir,
+                        chunk_size=cfg_seg.chunk_size,
+                        num_open_loop_steps=cfg_seg.num_open_loop_steps,
+                        future_primary_image_predictions=future_primary_image_predictions,
+                        future_secondary_image_predictions=future_secondary_image_predictions,
+                        future_wrist_image_predictions=future_wrist_image_predictions,
+                        show_diff=False,
+                        log_file=log_file,
+                        show_timestep=True,
+                    )
+                else:
+                    log_message(
+                        f"Skipping video with future predictions - not all camera predictions available "
+                        f"(primary: {future_primary_image_predictions is not None}, "
+                        f"secondary: {future_secondary_image_predictions is not None}, "
+                        f"wrist: {future_wrist_image_predictions is not None})",
+                        log_file,
+                    )
+            if cfg_seg.data_collection and collected_data is not None:
+                if len(collected_data["actions"]) < 5:
+                    log_message(
+                        f"Skipping saving this episode: less than 5 timesteps long "
+                        f"(only {len(collected_data['actions'])} timesteps).",
+                        log_file,
+                    )
+                else:
+                    processed_task_description = (
+                        task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:35]
+                    )
+                    ep_filename = (
+                        f"{DATE_TIME}--episode_data--task={processed_task_description}"
+                        f"--ep={episode_idx}--seg={seg_idx}--success={success}.hdf5"
+                    )
+                    ep_filepath = os.path.join(rollout_data_dir, ep_filename)
+                    with h5py.File(ep_filepath, "w") as f:
+                        for k, v in collected_data.items():
+                            if isinstance(v, np.ndarray):
+                                is_image = v.ndim == 4 and v.shape[-1] == 3 and v.dtype == np.uint8
+                                if is_image and cfg_seg.jpeg_compress:
+                                    jpeg_list = [jpeg_encode_image(frame, quality=95) for frame in v]
+                                    if len(jpeg_list) == 1:
+                                        continue
+                                    dt = h5py.vlen_dtype(np.dtype("uint8"))
+                                    f.create_dataset(k + "_jpeg", data=jpeg_list, dtype=dt)
+                                else:
+                                    f.create_dataset(k, data=v)
+                            else:
+                                f.attrs[k] = v
+                        f.attrs["task_description"] = task_description
+                    log_message(f"Saved episode data to: {ep_filepath}", log_file)
+            env.close()
+            log_message(f"Success: {success}", log_file)
+
+    flat_successes: List[bool] = []
+    flat_lengths: List[float] = []
+    for seg_idx, task_name in enumerate(chain_tasks):
+        sr = float(np.mean(per_seg_successes[seg_idx])) if per_seg_successes[seg_idx] else 0.0
+        avg_len = float(np.mean(per_seg_lengths[seg_idx])) if per_seg_lengths[seg_idx] else 0.0
+        log_message(
+            f"Task {task_name} (chain segment {seg_idx}) results: success_rate={sr:.4f}, avg_length={avg_len:.1f}",
+            log_file,
+        )
+        flat_successes.extend(per_seg_successes[seg_idx])
+        flat_lengths.extend(per_seg_lengths[seg_idx])
+        if cfg.use_wandb:
+            wandb.log(
+                {
+                    f"success_rate/{task_name}_chain_seg{seg_idx}": sr,
+                    f"avg_episode_length/{task_name}_chain_seg{seg_idx}": avg_len,
+                }
+            )
+
+    overall_rate = float(np.mean(flat_successes)) if flat_successes else 0.0
+    overall_avg_len = float(np.mean(flat_lengths)) if flat_lengths else 0.0
+    for ti in range(cfg.num_trials_per_task):
+        ok_trial = all(per_seg_successes[si][ti] for si in range(len(chain_tasks)))
+        log_message(f"Chain trial {ti} all_segments_success={ok_trial}", log_file)
+    return overall_rate, overall_avg_len, flat_successes
 
 
 def run_task(
@@ -1021,10 +1253,14 @@ def eval_robocasa(cfg: PolicyEvalConfig) -> float:
             planning_model, _ = get_planning_model(cfg)
         else:
             planning_model = None
+    chain_tasks = _parse_task_chain(cfg)
+    task_log_id = "__".join(chain_tasks) if chain_tasks else cfg.task_name
+    if len(task_log_id) > 200:
+        task_log_id = task_log_id[:200] + "__trunc"
     # Setup logging
     log_file, local_log_filepath, run_id = setup_logging(
         cfg=cfg,
-        task_identifier=cfg.task_name,
+        task_identifier=task_log_id,
         log_dir=cfg.local_log_dir,
         run_id_note=cfg.run_id_note,
         use_wandb=cfg.use_wandb,
@@ -1038,22 +1274,36 @@ def eval_robocasa(cfg: PolicyEvalConfig) -> float:
         log_message(f"Parallel inference enabled on GPUs: {available_gpus}", log_file)
         log_message(f"Parallel timeout: {cfg.parallel_timeout}s", log_file)
     # Run evaluation
-    log_message(f"\nStarting evaluation for task: {cfg.task_name}", log_file)
+    if chain_tasks:
+        log_message(f"\nStarting evaluation for task_chain: {' -> '.join(chain_tasks)}", log_file)
+    else:
+        log_message(f"\nStarting evaluation for task: {cfg.task_name}", log_file)
     log_message(f"Number of trials: {cfg.num_trials_per_task}", log_file)
-    success_rate, avg_length, successes = run_task(
-        cfg,
-        cfg.task_name,
-        model,
-        planning_model,
-        dataset_stats,
-        worker_pool,
-        log_file,
-    )
+    if chain_tasks:
+        success_rate, avg_length, successes = run_task_chain(
+            cfg,
+            chain_tasks,
+            model,
+            planning_model,
+            dataset_stats,
+            worker_pool,
+            log_file,
+        )
+    else:
+        success_rate, avg_length, successes = run_task(
+            cfg,
+            cfg.task_name,
+            model,
+            planning_model,
+            dataset_stats,
+            worker_pool,
+            log_file,
+        )
     # Log final results
     log_message("\n" + "=" * 80, log_file)
     log_message("FINAL RESULTS", log_file)
     log_message("=" * 80, log_file)
-    log_message(f"Task: {cfg.task_name}", log_file)
+    log_message(f"Task: {task_log_id}", log_file)
     log_message(f"Success rate: {success_rate:.4f} ({int(success_rate * 100)}%)", log_file)
     log_message(f"Average episode length: {avg_length:.1f}", log_file)
     log_message(f"Total episodes: {len(successes)}", log_file)

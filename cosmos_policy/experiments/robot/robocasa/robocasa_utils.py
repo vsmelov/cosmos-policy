@@ -22,6 +22,38 @@ from PIL import Image, ImageDraw, ImageFont
 from cosmos_policy.experiments.robot.robot_utils import DATE_TIME
 
 
+def _numpy_image_to_uint8_hwc(x: np.ndarray) -> np.ndarray:
+    """Coerce simulator or model outputs to contiguous uint8 HWC RGB for PIL / video."""
+    a = np.asarray(x)
+    if a.ndim == 2:
+        a = np.stack([a, a, a], axis=-1)
+    elif a.ndim == 3 and a.shape[2] == 1:
+        a = np.repeat(a, 3, axis=2)
+    if a.dtype != np.uint8:
+        f = a.astype(np.float32)
+        mn = float(f.min()) if f.size else 0.0
+        mx = float(f.max()) if f.size else 0.0
+        # Model heads often emit float32 in [0, 1] or [-1, 1]; direct uint8 cast would clip to black.
+        if mx <= 1.0 + 1e-3 and mn >= -1.0 - 1e-3 and mn < -1e-3:
+            f = (np.clip(f, -1.0, 1.0) + 1.0) * 0.5 * 255.0
+        elif mx <= 1.0 + 1e-3:
+            f = np.clip(f, 0.0, 1.0) * 255.0
+        else:
+            f = np.clip(f, 0.0, 255.0)
+        a = np.rint(f).astype(np.uint8)
+    if a.ndim == 3 and a.shape[2] > 3:
+        a = a[..., :3]
+    return np.ascontiguousarray(a)
+
+
+def _resize_uint8_hwc(img: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
+    u = _numpy_image_to_uint8_hwc(img)
+    pil_img = Image.fromarray(u)
+    if pil_img.size != (target_w, target_h):
+        pil_img = pil_img.resize((target_w, target_h), Image.LANCZOS)
+    return np.asarray(pil_img)
+
+
 def save_rollout_video(
     rollout_primary_images,
     rollout_secondary_images,
@@ -39,11 +71,27 @@ def save_rollout_video(
     )
     video_writer = imageio.get_writer(mp4_path, fps=30)
 
-    # Concatenate all three camera views horizontally: primary (left) | secondary (right) | wrist
+    # One panel size for the whole clip: varying H/W between timesteps breaks many MP4 writers.
+    panel_h = 0
+    panel_w = 0
     for primary_img, secondary_img, wrist_img in zip(
         rollout_primary_images, rollout_secondary_images, rollout_wrist_images
     ):
-        combined_img = np.concatenate([primary_img, secondary_img, wrist_img], axis=1)
+        for img in (primary_img, secondary_img, wrist_img):
+            u = _numpy_image_to_uint8_hwc(img)
+            panel_h = max(panel_h, int(u.shape[0]))
+            panel_w = max(panel_w, int(u.shape[1]))
+    if panel_h == 0 or panel_w == 0:
+        panel_h, panel_w = 224, 224
+
+    # Concatenate all three camera views horizontally: primary (left) | secondary | wrist.
+    for primary_img, secondary_img, wrist_img in zip(
+        rollout_primary_images, rollout_secondary_images, rollout_wrist_images
+    ):
+        p = _resize_uint8_hwc(_numpy_image_to_uint8_hwc(primary_img), panel_w, panel_h)
+        s = _resize_uint8_hwc(_numpy_image_to_uint8_hwc(secondary_img), panel_w, panel_h)
+        w = _resize_uint8_hwc(_numpy_image_to_uint8_hwc(wrist_img), panel_w, panel_h)
+        combined_img = np.ascontiguousarray(np.concatenate([p, s, w], axis=1))
         video_writer.append_data(combined_img)
 
     video_writer.close()
@@ -109,8 +157,9 @@ def save_rollout_video_with_future_image_predictions(
     if not future_secondary_image_predictions:
         raise ValueError("future_secondary_image_predictions must have at least one element")
 
-    # Get dimensions from future predictions to use for resizing
-    target_h, target_w, c = future_primary_image_predictions[0].shape
+    # Reference size from future frame (uint8 — float predictions were written into uint8 buffers as black)
+    ref0 = _numpy_image_to_uint8_hwc(future_primary_image_predictions[0])
+    target_h, target_w = ref0.shape[0], ref0.shape[1]
 
     # Define text parameters
     text_height = 60 if show_timestep else 30  # Height for text area (increased if showing timestep)
@@ -127,31 +176,29 @@ def save_rollout_video_with_future_image_predictions(
         processed_current_images = []
 
         for current_img in current_images_to_process:
-            # Convert numpy array to PIL Image
-            pil_img = Image.fromarray(current_img)
-
-            # Resize if needed
-            if pil_img.size != (target_w, target_h):
-                pil_img = pil_img.resize((target_w, target_h), Image.LANCZOS)
-
-            # Convert back to numpy array
-            processed_current_images.append(np.array(pil_img))
+            processed_current_images.append(_resize_uint8_hwc(current_img, target_w, target_h))
 
         # Unpack processed current images
         wrist_img_resized, primary_img_resized, secondary_img_resized = processed_current_images
 
         # Determine which future prediction images to use
-        future_idx = i // num_open_loop_steps
+        future_idx = i // max(int(num_open_loop_steps), 1)
         future_wrist_idx = min(future_idx, len(future_wrist_image_predictions) - 1)
         future_primary_idx = min(future_idx, len(future_primary_image_predictions) - 1)
         future_secondary_idx = min(future_idx, len(future_secondary_image_predictions) - 1)
 
-        future_wrist_img = future_wrist_image_predictions[future_wrist_idx]
-        future_primary_img = future_primary_image_predictions[future_primary_idx]
-        future_secondary_img = future_secondary_image_predictions[future_secondary_idx]
+        future_wrist_img = _resize_uint8_hwc(
+            future_wrist_image_predictions[future_wrist_idx], target_w, target_h
+        )
+        future_primary_img = _resize_uint8_hwc(
+            future_primary_image_predictions[future_primary_idx], target_w, target_h
+        )
+        future_secondary_img = _resize_uint8_hwc(
+            future_secondary_image_predictions[future_secondary_idx], target_w, target_h
+        )
 
-        # Create a combined image with 2 rows and 3 columns
-        combined_img = np.zeros((target_h * 2, target_w * 3, c), dtype=np.uint8)
+        # Create a combined image with 2 rows and 3 columns (always RGB for vstack with text banner)
+        combined_img = np.zeros((target_h * 2, target_w * 3, 3), dtype=np.uint8)
 
         # Top row: current images (wrist, primary, secondary)
         combined_img[:target_h, :target_w, :] = wrist_img_resized
@@ -273,8 +320,8 @@ def save_rollout_video_with_future_image_predictions_and_gt(
     if not future_secondary_image_predictions:
         raise ValueError("future_secondary_image_predictions must have at least one element")
 
-    # Get dimensions from future predictions to use for resizing
-    target_h, target_w, c = future_primary_image_predictions[0].shape
+    ref0 = _numpy_image_to_uint8_hwc(future_primary_image_predictions[0])
+    target_h, target_w = ref0.shape[0], ref0.shape[1]
 
     # Define text parameters
     text_height = 60 if show_timestep else 30  # Height for text area (increased if showing timestep)
@@ -318,32 +365,36 @@ def save_rollout_video_with_future_image_predictions_and_gt(
         processed_current_images = []
 
         for current_img in current_images_to_process:
-            # Convert numpy array to PIL Image
-            pil_img = Image.fromarray(current_img)
-
-            # Resize if needed
-            if pil_img.size != (target_w, target_h):
-                pil_img = pil_img.resize((target_w, target_h), Image.LANCZOS)
-
-            # Convert back to numpy array
-            processed_current_images.append(np.array(pil_img))
+            processed_current_images.append(_resize_uint8_hwc(current_img, target_w, target_h))
 
         # Unpack processed current images
         wrist_img_resized, primary_img_resized, secondary_img_resized = processed_current_images
 
         # Determine which future prediction images to use
-        future_idx = i // num_open_loop_steps
+        future_idx = i // max(int(num_open_loop_steps), 1)
         future_wrist_idx = min(future_idx, len(future_wrist_image_predictions) - 1)
         future_primary_idx = min(future_idx, len(future_primary_image_predictions) - 1)
         future_secondary_idx = min(future_idx, len(future_secondary_image_predictions) - 1)
 
-        future_wrist_img = future_wrist_image_predictions[future_wrist_idx]
-        future_primary_img = future_primary_image_predictions[future_primary_idx]
-        future_secondary_img = future_secondary_image_predictions[future_secondary_idx]
+        future_wrist_img = _resize_uint8_hwc(
+            future_wrist_image_predictions[future_wrist_idx], target_w, target_h
+        )
+        future_primary_img = _resize_uint8_hwc(
+            future_primary_image_predictions[future_primary_idx], target_w, target_h
+        )
+        future_secondary_img = _resize_uint8_hwc(
+            future_secondary_image_predictions[future_secondary_idx], target_w, target_h
+        )
 
-        gt_future_wrist_img = gt_future_wrist_image_predictions[future_wrist_idx]
-        gt_future_primary_img = gt_future_primary_image_predictions[future_primary_idx]
-        gt_future_secondary_img = gt_future_secondary_image_predictions[future_secondary_idx]
+        gt_future_wrist_img = _resize_uint8_hwc(
+            gt_future_wrist_image_predictions[future_wrist_idx], target_w, target_h
+        )
+        gt_future_primary_img = _resize_uint8_hwc(
+            gt_future_primary_image_predictions[future_primary_idx], target_w, target_h
+        )
+        gt_future_secondary_img = _resize_uint8_hwc(
+            gt_future_secondary_image_predictions[future_secondary_idx], target_w, target_h
+        )
 
         # Compute difference images if show_diff is True
         if show_diff:
@@ -358,9 +409,12 @@ def save_rollout_video_with_future_image_predictions_and_gt(
                 future_secondary_img.astype(np.float32) - gt_future_secondary_img.astype(np.float32)
             )
             secondary_diff = np.clip(secondary_diff, 0, 255).astype(np.uint8)
+        else:
+            z = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+            wrist_diff = primary_diff = secondary_diff = z
 
         # Create a combined image with 4 rows and 3 columns
-        combined_img = np.zeros((target_h * 4, target_w * 3, c), dtype=np.uint8)
+        combined_img = np.zeros((target_h * 4, target_w * 3, 3), dtype=np.uint8)
 
         # Top row: current images (wrist, primary, secondary)
         combined_img[:target_h, :target_w, :] = wrist_img_resized
