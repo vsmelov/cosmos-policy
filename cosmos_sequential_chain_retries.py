@@ -17,7 +17,7 @@ Artifacts (under cfg.local_log_dir, typically …/sequential_retries/<experiment
       attempt_scene.json               ep_meta (object_cfgs, fixtures, lang, …), cfg, объекты в сцене
       *.mp4 (rollout + optional future_pred) в этой же папке
     run_XXX/full_run_episode--*.mp4   склейка всех стадий + плавный «домой» 1s между стадиями (без future overlay)
-      turnoff_stage_debug.log          (chain4, stage «press stop»: JSONL по каждому env.step + summary в конце)
+      turnoff_stage_debug.log          (chain4 st2 / chain6 st3 «press stop»: JSONL по env.step + summary)
 
 Env:
   COSMOS_SEQ_CHAIN_RUNS       outer loop count (default 10)
@@ -523,7 +523,12 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
                     )
 
                 env._chain4_turnoff_debug_fp = None
-                if cfg.task_name == "PnPRoboarmCosmosChain4MicrowaveCloseOnOffOpen" and stage_idx == 2:
+                # Must match robocasa ``_CHAIN_TURNOFF_DEBUG_STAGE_BY_CLASS`` (TurnOffMicrowave horizon index).
+                _turnoff_debug_stage_idx = {
+                    "PnPRoboarmCosmosChain4MicrowaveCloseOnOffOpen": 2,
+                    "PnPRoboarmCosmosChain6PotatoMwPlate": 3,
+                }.get(cfg.task_name)
+                if _turnoff_debug_stage_idx is not None and stage_idx == _turnoff_debug_stage_idx:
                     _tdbg = adir / "turnoff_stage_debug.log"
                     env._chain4_turnoff_debug_fp = _tdbg.open("w", encoding="utf-8")
                     env._chain4_turnoff_min_eef = float("inf")
