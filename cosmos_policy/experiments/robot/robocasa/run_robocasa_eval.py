@@ -130,9 +130,9 @@ TASK_MAX_STEPS = {
     "OpenDrawer": 500,
     "CloseDrawer": 500,
     "PnPDrawerToCounter": 600,
-    # Stove tasks
-    "TurnOnStove": 500,
-    "TurnOffStove": 500,
+    # Stove tasks (multi-burner scenes may need more steps after prior-stage arm blends)
+    "TurnOnStove": 900,
+    "TurnOffStove": 900,
     # Sink tasks
     "TurnOnSinkFaucet": 500,
     "TurnOffSinkFaucet": 500,
