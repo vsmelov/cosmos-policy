@@ -117,8 +117,8 @@ TASK_MAX_STEPS = {
     "PnPCabToCounter": 500,
     "PnPCounterToSink": 700,
     "PnPSinkToCounter": 500,
-    "PnPCounterToMicrowave": 600,
-    "PnPMicrowaveToCounter": 500,
+    "PnPCounterToMicrowave": 900,
+    "PnPMicrowaveToCounter": 900,
     "PnPCounterToStove": 500,
     "PnPStoveToCounter": 500,
     # Door tasks
