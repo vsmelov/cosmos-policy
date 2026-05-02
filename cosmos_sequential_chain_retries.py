@@ -750,17 +750,32 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
                 log_message(f"Run {irun}: abort after stage {stage_idx} exhaustion.", lf_run)
                 break
 
-        if run_ok and run_rollout_primary:
+        save_full_mp4 = run_ok or os.environ.get("COSMOS_SEQ_FULL_RUN_VIDEO_ON_ABORT", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if save_full_mp4 and run_rollout_primary:
             try:
+                full_task = (
+                    "full_run_episode_including_arm_home"
+                    if run_ok
+                    else "partial_run_through_last_success_stage"
+                )
                 save_rollout_video(
                     run_rollout_primary,
                     run_rollout_secondary,
                     run_rollout_wrist,
                     irun,
-                    success=True,
-                    task_description="full_run_episode_including_arm_home",
+                    success=bool(run_ok),
+                    task_description=full_task,
                     rollout_data_dir=str(run_dir),
                     log_file=lf_run,
+                )
+                _orc_log(
+                    lf_run,
+                    f"full-run MP4 saved ({full_task}, run_ok={run_ok}, frames={len(run_rollout_primary)})",
+                    stderr_too=True,
                 )
             except Exception as e:
                 _orc_log(lf_run, f"warn: full-run video not saved: {e!r}", stderr_too=False)
