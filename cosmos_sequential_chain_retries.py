@@ -438,6 +438,9 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
         run_rollout_primary: list = []
         run_rollout_secondary: list = []
         run_rollout_wrist: list = []
+        last_attempt_primary: list = []
+        last_attempt_secondary: list = []
+        last_attempt_wrist: list = []
 
         set_seed_everywhere(cfg.seed)
 
@@ -627,6 +630,10 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
                 )
                 _lf_flush(lf_run)
 
+                last_attempt_primary = list(replay_primary_images)
+                last_attempt_secondary = list(replay_secondary_images)
+                last_attempt_wrist = list(replay_wrist_images)
+
                 _k_chain3.write_chain4_turnoff_stage_debug_log(adir, env, bool(success))
 
                 _save_stage_rollouts(
@@ -755,17 +762,21 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
             "true",
             "yes",
         )
-        if save_full_mp4 and run_rollout_primary:
+        stitch_primary = run_rollout_primary or last_attempt_primary
+        stitch_secondary = run_rollout_secondary or last_attempt_secondary
+        stitch_wrist = run_rollout_wrist or last_attempt_wrist
+        if save_full_mp4 and stitch_primary:
             try:
-                full_task = (
-                    "full_run_episode_including_arm_home"
-                    if run_ok
-                    else "partial_run_through_last_success_stage"
-                )
+                if run_ok:
+                    full_task = "full_run_episode_including_arm_home"
+                elif run_rollout_primary:
+                    full_task = "partial_run_through_last_success_stage"
+                else:
+                    full_task = "partial_run_last_attempt_only"
                 save_rollout_video(
-                    run_rollout_primary,
-                    run_rollout_secondary,
-                    run_rollout_wrist,
+                    stitch_primary,
+                    stitch_secondary,
+                    stitch_wrist,
                     irun,
                     success=bool(run_ok),
                     task_description=full_task,
@@ -774,7 +785,7 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
                 )
                 _orc_log(
                     lf_run,
-                    f"full-run MP4 saved ({full_task}, run_ok={run_ok}, frames={len(run_rollout_primary)})",
+                    f"full-run MP4 saved ({full_task}, run_ok={run_ok}, frames={len(stitch_primary)})",
                     stderr_too=True,
                 )
             except Exception as e:
