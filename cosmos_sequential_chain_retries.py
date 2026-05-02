@@ -16,7 +16,8 @@ Artifacts (under cfg.local_log_dir, typically …/sequential_retries/<experiment
       attempt_meta.json                (+ instruction_lang, layout/style id)
       attempt_scene.json               ep_meta (object_cfgs, fixtures, lang, …), cfg, объекты в сцене
       *.mp4 (rollout + optional future_pred) в этой же папке
-    run_XXX/full_run_episode--*.mp4   склейка всех стадий + плавный «домой» 1s между стадиями (без future overlay)
+    run_XXX/*full_run*.mp4            склейка RGB (primary|secondary|wrist)
+    run_XXX/*with_future_img*full*.mp4  та же склейка с future-панелью (2 ряда, как в per-stage)
       turnoff_stage_debug.log          (chain4 st2 / chain6 st3 «press stop»: JSONL по env.step + summary)
 
 Env:
@@ -56,10 +57,14 @@ from cosmos_policy.experiments.robot.cosmos_utils import (
     init_t5_text_embeddings_cache,
     load_dataset_stats,
 )
-from cosmos_policy.experiments.robot.robocasa.robocasa_utils import save_rollout_video
+from cosmos_policy.experiments.robot.robocasa.robocasa_utils import (
+    save_rollout_video,
+    save_rollout_video_with_future_image_predictions,
+)
 from cosmos_policy.experiments.robot.robocasa.run_robocasa_eval import (
     TASK_MAX_STEPS,
     PolicyEvalConfig,
+    _snapshot_future_image_predictions,
     create_robocasa_env,
     prepare_observation,
     run_episode,
@@ -386,14 +391,43 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
         with orc_summ.open("a", encoding="utf-8") as otl:
             otl.write(line)
 
+    def _aligned_future_rows(
+        future_image_predictions_list: list | None,
+        num_frames: int,
+        num_open_loop_steps: int,
+    ) -> tuple[list, list, list] | None:
+        """One future RGB triplet per rollout frame (same indexing as ``save_rollout_video_with_future_image_predictions``)."""
+        if not future_image_predictions_list or num_frames <= 0:
+            return None
+        n_ops = max(1, int(num_open_loop_steps))
+        out_p: list = []
+        out_s: list = []
+        out_w: list = []
+        for i in range(num_frames):
+            fi = min(i // n_ops, len(future_image_predictions_list) - 1)
+            d = future_image_predictions_list[fi]
+            fp = d.get("future_image")
+            fs = d.get("future_image2")
+            fw = d.get("future_wrist_image")
+            if fp is None or fs is None or fw is None:
+                return None
+            out_p.append(np.array(fp, copy=True, order="C"))
+            out_s.append(np.array(fs, copy=True, order="C"))
+            out_w.append(np.array(fw, copy=True, order="C"))
+        return out_p, out_s, out_w
+
     def _append_rollout_frame_from_env_robot_obs(
         env: Any,
         cfg0: PolicyEvalConfig,
         rp: list,
         rs: list,
         rw: list,
+        f_p: list | None,
+        f_s: list | None,
+        f_w: list | None,
+        pending_future_holder: list,
     ) -> None:
-        """After arm-home ``sim.forward`` substeps, refresh cached obs and append RGB (same layout as run_episode)."""
+        """After arm-home ``sim.forward`` substeps, append RGB (+ optional future row aligned with stitched MP4)."""
         try:
             obs = env._get_observations()
         except Exception:
@@ -406,6 +440,22 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
             rs.append(np.array(si, copy=True, order="C"))
         if wi is not None:
             rw.append(np.array(wi, copy=True, order="C"))
+        if f_p is None or f_s is None or f_w is None:
+            return
+        tail = pending_future_holder[0]
+        if tail is not None:
+            try:
+                f_p.append(np.array(tail["future_image"], copy=True, order="C"))
+                f_s.append(np.array(tail["future_image2"], copy=True, order="C"))
+                f_w.append(np.array(tail["future_wrist_image"], copy=True, order="C"))
+            except Exception:
+                f_p.append(np.array(pi, copy=True, order="C"))
+                f_s.append(np.array(si, copy=True, order="C"))
+                f_w.append(np.array(wi, copy=True, order="C"))
+        else:
+            f_p.append(np.array(pi, copy=True, order="C"))
+            f_s.append(np.array(si, copy=True, order="C"))
+            f_w.append(np.array(wi, copy=True, order="C"))
 
     global_outcomes: list[dict[str, Any]] = []
 
@@ -438,9 +488,15 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
         run_rollout_primary: list = []
         run_rollout_secondary: list = []
         run_rollout_wrist: list = []
+        run_rollout_future_primary: list = []
+        run_rollout_future_secondary: list = []
+        run_rollout_future_wrist: list = []
         last_attempt_primary: list = []
         last_attempt_secondary: list = []
         last_attempt_wrist: list = []
+        last_attempt_future_primary: list = []
+        last_attempt_future_secondary: list = []
+        last_attempt_future_wrist: list = []
 
         set_seed_everywhere(cfg.seed)
 
@@ -558,7 +614,7 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
                     lf_run,
                     f"attemptdir={adir} | cfg.seed(политики)={attempt_seed} | "
                     f'instruction="{task_description}" | horizon_name={horizon_name} | '
-                    f"max_steps≈{max_steps_horizon} (внутри run_episode ~10 warmup step нулём)",
+                    f"max_steps≈{max_steps_horizon} (warmup: 10×zero-step при chain_stage=0, иначе 10×sim.forward)",
                     stderr_too=True,
                 )
                 _orc_log(
@@ -633,6 +689,17 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
                 last_attempt_primary = list(replay_primary_images)
                 last_attempt_secondary = list(replay_secondary_images)
                 last_attempt_wrist = list(replay_wrist_images)
+                _al_fut = _aligned_future_rows(
+                    future_image_predictions_list,
+                    len(replay_primary_images),
+                    int(cfg_logged.num_open_loop_steps),
+                )
+                if _al_fut is not None:
+                    last_attempt_future_primary, last_attempt_future_secondary, last_attempt_future_wrist = _al_fut
+                else:
+                    last_attempt_future_primary = []
+                    last_attempt_future_secondary = []
+                    last_attempt_future_wrist = []
 
                 _k_chain3.write_chain4_turnoff_stage_debug_log(adir, env, bool(success))
 
@@ -672,11 +739,38 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
                     run_rollout_primary.extend(replay_primary_images)
                     run_rollout_secondary.extend(replay_secondary_images)
                     run_rollout_wrist.extend(replay_wrist_images)
+                    _run_fut = _aligned_future_rows(
+                        future_image_predictions_list,
+                        len(replay_primary_images),
+                        int(cfg_logged.num_open_loop_steps),
+                    )
+                    if _run_fut is not None:
+                        run_rollout_future_primary.extend(_run_fut[0])
+                        run_rollout_future_secondary.extend(_run_fut[1])
+                        run_rollout_future_wrist.extend(_run_fut[2])
                     if stage_idx < num_stages - 1:
                         try:
-                            env._chain_arm_home_capture_cb = lambda e: _append_rollout_frame_from_env_robot_obs(
-                                e, cfg, run_rollout_primary, run_rollout_secondary, run_rollout_wrist
-                            )
+                            _fut_ok = _run_fut is not None
+                            _pend_holder: list[Any] = [
+                                _snapshot_future_image_predictions(future_image_predictions_list[-1])
+                                if future_image_predictions_list
+                                else None
+                            ]
+
+                            def _arm_home_capture_cb(e):
+                                _append_rollout_frame_from_env_robot_obs(
+                                    e,
+                                    cfg,
+                                    run_rollout_primary,
+                                    run_rollout_secondary,
+                                    run_rollout_wrist,
+                                    run_rollout_future_primary if _fut_ok else None,
+                                    run_rollout_future_secondary if _fut_ok else None,
+                                    run_rollout_future_wrist if _fut_ok else None,
+                                    _pend_holder,
+                                )
+
+                            env._chain_arm_home_capture_cb = _arm_home_capture_cb
                             env.advance_chain_stage()
                         finally:
                             if hasattr(env, "_chain_arm_home_capture_cb"):
@@ -765,6 +859,9 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
         stitch_primary = run_rollout_primary or last_attempt_primary
         stitch_secondary = run_rollout_secondary or last_attempt_secondary
         stitch_wrist = run_rollout_wrist or last_attempt_wrist
+        stitch_fp = run_rollout_future_primary or last_attempt_future_primary
+        stitch_fs = run_rollout_future_secondary or last_attempt_future_secondary
+        stitch_fw = run_rollout_future_wrist or last_attempt_future_wrist
         if save_full_mp4 and stitch_primary:
             try:
                 if run_ok:
@@ -788,6 +885,41 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
                     f"full-run MP4 saved ({full_task}, run_ok={run_ok}, frames={len(stitch_primary)})",
                     stderr_too=True,
                 )
+                n_st = len(stitch_primary)
+                if stitch_fp and stitch_fs and stitch_fw and n_st > 0:
+                    for lst in (stitch_fp, stitch_fs, stitch_fw):
+                        while len(lst) < n_st and lst:
+                            lst.append(np.array(lst[-1], copy=True, order="C"))
+                    if len(stitch_fp) == n_st == len(stitch_fs) == len(stitch_fw):
+                        save_rollout_video_with_future_image_predictions(
+                            stitch_primary,
+                            stitch_secondary,
+                            stitch_wrist,
+                            irun,
+                            success=bool(run_ok),
+                            task_description=full_task,
+                            rollout_data_dir=str(run_dir),
+                            chunk_size=int(cfg.chunk_size),
+                            num_open_loop_steps=int(cfg.num_open_loop_steps),
+                            future_primary_image_predictions=stitch_fp,
+                            future_secondary_image_predictions=stitch_fs,
+                            future_wrist_image_predictions=stitch_fw,
+                            show_diff=False,
+                            log_file=lf_run,
+                            show_timestep=True,
+                        )
+                        _orc_log(
+                            lf_run,
+                            f"full-run future-overlay MP4 saved ({full_task}, frames={n_st})",
+                            stderr_too=True,
+                        )
+                    else:
+                        _orc_log(
+                            lf_run,
+                            f"warn: skip future full-run MP4 (future len mismatch: "
+                            f"{len(stitch_fp)},{len(stitch_fs)},{len(stitch_fw)} vs {n_st})",
+                            stderr_too=False,
+                        )
             except Exception as e:
                 _orc_log(lf_run, f"warn: full-run video not saved: {e!r}", stderr_too=False)
 

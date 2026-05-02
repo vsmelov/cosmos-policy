@@ -436,11 +436,19 @@ def run_episode(
     task_name_for_horizon: Optional[str] = None,
 ):
     """Run a single evaluation episode."""
-    # Wait for objects to stabilize
+    # Wait for objects / contacts to settle. On multi-stage *same* env, ``chain_stage > 0`` means we already
+    # advanced physics (arm blend, etc.); ``env.step(zeros)`` would run OSC / controllers and often drifts
+    # the arm away from the post-``advance_chain_stage`` pose before the first policy query.
     NUM_STEPS_WAIT = 10
-    for _ in range(NUM_STEPS_WAIT):
-        dummy_action = np.zeros(env.action_spec[0].shape)
-        obs, _, _, _ = env.step(dummy_action)
+    chain_stage = int(getattr(env, "chain_stage", 0))
+    if chain_stage > 0:
+        for _ in range(NUM_STEPS_WAIT):
+            env.sim.forward()
+        obs = env._get_observations()
+    else:
+        for _ in range(NUM_STEPS_WAIT):
+            dummy_action = np.zeros(env.action_spec[0].shape)
+            obs, _, _, _ = env.step(dummy_action)
     # Get max steps for this task
     horizon_name = task_name_for_horizon if task_name_for_horizon is not None else cfg.task_name
     max_steps = TASK_MAX_STEPS.get(horizon_name, 500)
