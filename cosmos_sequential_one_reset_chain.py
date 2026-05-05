@@ -14,6 +14,7 @@ import os
 import sys
 
 import draccus
+import numpy as np
 
 # Register RoboCasa envs (including PnPRoboarmCosmosChain3) before robosuite.make.
 import robocasa  # noqa: F401
@@ -31,7 +32,10 @@ from cosmos_policy.experiments.robot.robocasa.robocasa_utils import (
 )
 from cosmos_policy.experiments.robot.robocasa.run_robocasa_eval import (
     PolicyEvalConfig,
+    _snapshot_future_image_predictions,
     create_robocasa_env,
+    prepare_observation,
+    render_robocasa_eval_camera_triplet,
     run_episode,
     validate_config,
 )
@@ -65,6 +69,7 @@ def _save_stage_rollouts(
     replay_wrist_images,
     future_image_predictions_list,
     log_file,
+    frame_captions=None,
 ):
     # Videos next to attempt_meta / logs (retry folder), not rollout_data/<long_slug>/.
     rollout_data_dir = cfg.local_log_dir
@@ -78,6 +83,7 @@ def _save_stage_rollouts(
         task_description=task_description,
         rollout_data_dir=rollout_data_dir,
         log_file=log_file,
+        frame_captions=frame_captions,
     )
     if len(future_image_predictions_list) > 0:
         fp = fs = fw = None
@@ -113,6 +119,7 @@ def _save_stage_rollouts(
                 show_diff=False,
                 log_file=log_file,
                 show_timestep=True,
+                frame_captions=frame_captions,
             )
 
 
@@ -199,6 +206,54 @@ def main(cfg: PolicyEvalConfig) -> int:
                 episode_log_index=ep_log_idx,
                 task_name_for_horizon=horizon_name,
             )
+            n0 = len(replay_primary_images)
+            seg_lbl = f"t{trial_idx} S{stage_idx} {horizon_name[:22]}"
+            arm_lbl = f"t{trial_idx} ARM_HOME→S{stage_idx + 1}"
+            if success and stage_idx < num_stages - 1:
+
+                def _append_replay_arm_home_frame(e):
+                    pi, si, wi = render_robocasa_eval_camera_triplet(
+                        e, env_img_res=int(cfg.env_img_res), flip_images=bool(cfg.flip_images)
+                    )
+                    if pi is None or si is None or wi is None:
+                        try:
+                            obs = e._get_observations()
+                        except Exception:
+                            return
+                        observation = prepare_observation(obs, cfg.flip_images)
+                        pi, si, wi = (
+                            observation["primary_image"],
+                            observation["secondary_image"],
+                            observation["wrist_image"],
+                        )
+                    if pi is not None:
+                        replay_primary_images.append(np.array(pi, copy=True, order="C"))
+                    if si is not None:
+                        replay_secondary_images.append(np.array(si, copy=True, order="C"))
+                    if wi is not None:
+                        replay_wrist_images.append(np.array(wi, copy=True, order="C"))
+
+                try:
+                    env._chain_arm_home_capture_cb = _append_replay_arm_home_frame
+                    env.advance_chain_stage()
+                finally:
+                    if hasattr(env, "_chain_arm_home_capture_cb"):
+                        delattr(env, "_chain_arm_home_capture_cb")
+                for _ in range(len(replay_primary_images) - n0):
+                    if future_image_predictions_list:
+                        future_image_predictions_list.append(
+                            _snapshot_future_image_predictions(future_image_predictions_list[-1])
+                        )
+            ntot = len(replay_primary_images)
+            if ntot:
+                if success and stage_idx < num_stages - 1 and ntot > n0:
+                    fc = [seg_lbl] * n0 + [arm_lbl] * (ntot - n0)
+                elif success:
+                    fc = [seg_lbl] * ntot
+                else:
+                    fc = [f"{seg_lbl} FAIL"] * ntot
+            else:
+                fc = None
             _save_stage_rollouts(
                 cfg,
                 stage_idx,
@@ -210,13 +265,25 @@ def main(cfg: PolicyEvalConfig) -> int:
                 replay_wrist_images,
                 future_image_predictions_list,
                 log_file,
+                frame_captions=fc,
             )
+            n_arm = len(replay_primary_images) - n0
+            if success and stage_idx < num_stages - 1 and n_arm > 0:
+                save_rollout_video(
+                    replay_primary_images[-n_arm:],
+                    replay_secondary_images[-n_arm:],
+                    replay_wrist_images[-n_arm:],
+                    trial_idx,
+                    success=True,
+                    task_description=f"arm_home_only_after_stage_{stage_idx:02d}",
+                    rollout_data_dir=cfg.local_log_dir,
+                    log_file=log_file,
+                    frame_captions=[arm_lbl] * n_arm,
+                )
             if not success:
                 trial_ok = False
                 log_message(f"Stage {stage_idx} failed; stopping trial (no further resets).", log_file)
                 break
-            if stage_idx < num_stages - 1:
-                env.advance_chain_stage()
         env.close()
         all_trial_ok.append(trial_ok)
         log_message(f"Chain trial {trial_idx} all_segments_success={trial_ok}", log_file)

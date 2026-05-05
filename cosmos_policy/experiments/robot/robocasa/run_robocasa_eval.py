@@ -70,7 +70,7 @@ import secrets
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import draccus
 import h5py
@@ -349,6 +349,39 @@ def prepare_observation(obs, flip_images: bool = False):
         "proprio": proprio,
     }
     return observation
+
+
+def render_robocasa_eval_camera_triplet(
+    env,
+    *,
+    env_img_res: int = 224,
+    flip_images: bool = True,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+    """Return fresh left / right / wrist RGB (uint8 HWC) after physics-only updates.
+
+    After bare ``sim.forward()`` or direct ``qpos`` writes, ``_get_observations()`` can still expose
+    a stale camera buffer (same pixels every frame in MP4). RoboCasa eval scripts use ``sim.render``
+    for reliable offscreen frames; we mirror that here for arm-home capture and similar paths.
+    """
+    h = w = int(env_img_res)
+    names = ("robot0_agentview_left", "robot0_agentview_right", "robot0_eye_in_hand")
+    out: List[Optional[np.ndarray]] = []
+    for cam in names:
+        try:
+            try:
+                img = env.sim.render(height=h, width=w, camera_name=cam, depth=False)
+            except TypeError:
+                img = env.sim.render(height=h, width=w, camera_name=cam)
+        except Exception:
+            out.append(None)
+            continue
+        ar = np.asarray(img)
+        if ar.dtype != np.uint8:
+            ar = np.clip(ar, 0.0, 255.0).astype(np.uint8)
+        if flip_images:
+            ar = np.flipud(ar)
+        out.append(np.ascontiguousarray(ar))
+    return out[0], out[1], out[2]
 
 
 def create_robocasa_env(cfg: PolicyEvalConfig, seed=None, episode_idx=None):

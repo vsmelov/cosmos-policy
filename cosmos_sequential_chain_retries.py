@@ -67,6 +67,7 @@ from cosmos_policy.experiments.robot.robocasa.run_robocasa_eval import (
     _snapshot_future_image_predictions,
     create_robocasa_env,
     prepare_observation,
+    render_robocasa_eval_camera_triplet,
     run_episode,
     validate_config,
 )
@@ -428,12 +429,20 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
         pending_future_holder: list,
     ) -> None:
         """After arm-home ``sim.forward`` substeps, append RGB (+ optional future row aligned with stitched MP4)."""
-        try:
-            obs = env._get_observations()
-        except Exception:
-            return
-        observation = prepare_observation(obs, cfg0.flip_images)
-        pi, si, wi = observation["primary_image"], observation["secondary_image"], observation["wrist_image"]
+        pi, si, wi = render_robocasa_eval_camera_triplet(
+            env, env_img_res=int(cfg0.env_img_res), flip_images=bool(cfg0.flip_images)
+        )
+        if pi is None or si is None or wi is None:
+            try:
+                obs = env._get_observations()
+            except Exception:
+                return
+            observation = prepare_observation(obs, cfg0.flip_images)
+            pi, si, wi = (
+                observation["primary_image"],
+                observation["secondary_image"],
+                observation["wrist_image"],
+            )
         if pi is not None:
             rp.append(np.array(pi, copy=True, order="C"))
         if si is not None:
@@ -491,6 +500,7 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
         run_rollout_future_primary: list = []
         run_rollout_future_secondary: list = []
         run_rollout_future_wrist: list = []
+        run_rollout_captions: list = []
         last_attempt_primary: list = []
         last_attempt_secondary: list = []
         last_attempt_wrist: list = []
@@ -686,95 +696,41 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
                 )
                 _lf_flush(lf_run)
 
-                last_attempt_primary = list(replay_primary_images)
-                last_attempt_secondary = list(replay_secondary_images)
-                last_attempt_wrist = list(replay_wrist_images)
-                _al_fut = _aligned_future_rows(
-                    future_image_predictions_list,
-                    len(replay_primary_images),
-                    int(cfg_logged.num_open_loop_steps),
-                )
-                if _al_fut is not None:
-                    last_attempt_future_primary, last_attempt_future_secondary, last_attempt_future_wrist = _al_fut
-                else:
-                    last_attempt_future_primary = []
-                    last_attempt_future_secondary = []
-                    last_attempt_future_wrist = []
-
                 _k_chain3.write_chain4_turnoff_stage_debug_log(adir, env, bool(success))
 
-                _save_stage_rollouts(
-                    cfg_logged,
-                    stage_idx,
-                    irun,
-                    success,
-                    task_description,
-                    replay_primary_images,
-                    replay_secondary_images,
-                    replay_wrist_images,
-                    future_image_predictions_list,
-                    lf_run,
-                )
-                _orc_log(lf_run, f"видеокадры сохранены в {adir.resolve()}/")
-                _lf_flush(lf_run)
-
-                _em = env.get_ep_meta()
-                am = {
-                    "stage_idx": stage_idx,
-                    "retry_idx": retry_idx,
-                    "attempt_seed": attempt_seed,
-                    "success": bool(success),
-                    "episode_length": int(ep_len),
-                    "attempt_dir": str(adir.relative_to(run_dir)),
-                    "instruction_lang": task_description,
-                    "layout_id": _em.get("layout_id"),
-                    "style_id": _em.get("style_id"),
-                    "horizon_name": horizon_name,
-                }
-                (adir / "attempt_meta.json").write_text(json.dumps(am, indent=2))
-                attempt_metas.append(am)
+                n0_ep = len(replay_primary_images)
+                seg_cap = f"r{irun:03d} S{stage_idx} {horizon_name[:24]}"
+                arm_cap = f"r{irun:03d} ARM_HOME→S{stage_idx + 1}"
 
                 if success:
                     succeeded = True
-                    run_rollout_primary.extend(replay_primary_images)
-                    run_rollout_secondary.extend(replay_secondary_images)
-                    run_rollout_wrist.extend(replay_wrist_images)
-                    _run_fut = _aligned_future_rows(
-                        future_image_predictions_list,
-                        len(replay_primary_images),
-                        int(cfg_logged.num_open_loop_steps),
-                    )
-                    if _run_fut is not None:
-                        run_rollout_future_primary.extend(_run_fut[0])
-                        run_rollout_future_secondary.extend(_run_fut[1])
-                        run_rollout_future_wrist.extend(_run_fut[2])
                     if stage_idx < num_stages - 1:
                         try:
-                            _fut_ok = _run_fut is not None
-                            _pend_holder: list[Any] = [
-                                _snapshot_future_image_predictions(future_image_predictions_list[-1])
-                                if future_image_predictions_list
-                                else None
-                            ]
 
-                            def _arm_home_capture_cb(e):
+                            def _arm_cb(e):
                                 _append_rollout_frame_from_env_robot_obs(
                                     e,
                                     cfg,
-                                    run_rollout_primary,
-                                    run_rollout_secondary,
-                                    run_rollout_wrist,
-                                    run_rollout_future_primary if _fut_ok else None,
-                                    run_rollout_future_secondary if _fut_ok else None,
-                                    run_rollout_future_wrist if _fut_ok else None,
-                                    _pend_holder,
+                                    replay_primary_images,
+                                    replay_secondary_images,
+                                    replay_wrist_images,
+                                    None,
+                                    None,
+                                    None,
+                                    [None],
                                 )
 
-                            env._chain_arm_home_capture_cb = _arm_home_capture_cb
+                            env._chain_arm_home_capture_cb = _arm_cb
                             env.advance_chain_stage()
                         finally:
                             if hasattr(env, "_chain_arm_home_capture_cb"):
                                 delattr(env, "_chain_arm_home_capture_cb")
+                        n_arm = len(replay_primary_images) - n0_ep
+                        for _ in range(n_arm):
+                            if future_image_predictions_list:
+                                future_image_predictions_list.append(
+                                    _snapshot_future_image_predictions(future_image_predictions_list[-1])
+                                )
                         checkpoint_before_stage = _snapshot_for_checkpoint(env, irun)
                         _orc_log(
                             lf_run,
@@ -836,13 +792,128 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
                             f"after_stage{stage_idx:02d}_success_terminal",
                             run_seed_layout=run_seed_base,
                         )
-                    break
+
+                    last_attempt_primary = list(replay_primary_images)
+                    last_attempt_secondary = list(replay_secondary_images)
+                    last_attempt_wrist = list(replay_wrist_images)
+                    _al_fut = _aligned_future_rows(
+                        future_image_predictions_list,
+                        len(replay_primary_images),
+                        int(cfg_logged.num_open_loop_steps),
+                    )
+                    if _al_fut is not None:
+                        last_attempt_future_primary, last_attempt_future_secondary, last_attempt_future_wrist = _al_fut
+                    else:
+                        last_attempt_future_primary = []
+                        last_attempt_future_secondary = []
+                        last_attempt_future_wrist = []
+                    ntot = len(replay_primary_images)
+                    fc = (
+                        [seg_cap] * n0_ep + [arm_cap] * (ntot - n0_ep)
+                        if (stage_idx < num_stages - 1 and ntot > n0_ep)
+                        else ([seg_cap] * ntot if ntot else None)
+                    )
+                    _save_stage_rollouts(
+                        cfg_logged,
+                        stage_idx,
+                        irun,
+                        success,
+                        task_description,
+                        replay_primary_images,
+                        replay_secondary_images,
+                        replay_wrist_images,
+                        future_image_predictions_list,
+                        lf_run,
+                        frame_captions=fc,
+                    )
+                    n_arm_only = ntot - n0_ep
+                    if n_arm_only > 0:
+                        try:
+                            save_rollout_video(
+                                replay_primary_images[-n_arm_only:],
+                                replay_secondary_images[-n_arm_only:],
+                                replay_wrist_images[-n_arm_only:],
+                                irun,
+                                success=True,
+                                task_description=f"arm_home_only_after_stage_{stage_idx:02d}",
+                                rollout_data_dir=str(adir),
+                                log_file=lf_run,
+                                frame_captions=[arm_cap] * n_arm_only,
+                            )
+                        except Exception as e:
+                            _orc_log(lf_run, f"warn: arm_home-only mp4: {e!r}", stderr_too=False)
+                    run_rollout_primary.extend(replay_primary_images)
+                    run_rollout_secondary.extend(replay_secondary_images)
+                    run_rollout_wrist.extend(replay_wrist_images)
+                    _run_fut = _aligned_future_rows(
+                        future_image_predictions_list,
+                        len(replay_primary_images),
+                        int(cfg_logged.num_open_loop_steps),
+                    )
+                    if _run_fut is not None:
+                        run_rollout_future_primary.extend(_run_fut[0])
+                        run_rollout_future_secondary.extend(_run_fut[1])
+                        run_rollout_future_wrist.extend(_run_fut[2])
+                    run_rollout_captions.extend([seg_cap] * n0_ep)
+                    if ntot > n0_ep:
+                        run_rollout_captions.extend([arm_cap] * (ntot - n0_ep))
                 else:
+                    last_attempt_primary = list(replay_primary_images)
+                    last_attempt_secondary = list(replay_secondary_images)
+                    last_attempt_wrist = list(replay_wrist_images)
+                    _al_fut = _aligned_future_rows(
+                        future_image_predictions_list,
+                        len(replay_primary_images),
+                        int(cfg_logged.num_open_loop_steps),
+                    )
+                    if _al_fut is not None:
+                        last_attempt_future_primary, last_attempt_future_secondary, last_attempt_future_wrist = _al_fut
+                    else:
+                        last_attempt_future_primary = []
+                        last_attempt_future_secondary = []
+                        last_attempt_future_wrist = []
+                    n_fail = len(replay_primary_images)
+                    fc_fail = [f"{seg_cap} retry{retry_idx} FAIL"] * n_fail if n_fail else None
+                    _save_stage_rollouts(
+                        cfg_logged,
+                        stage_idx,
+                        irun,
+                        success,
+                        task_description,
+                        replay_primary_images,
+                        replay_secondary_images,
+                        replay_wrist_images,
+                        future_image_predictions_list,
+                        lf_run,
+                        frame_captions=fc_fail,
+                    )
                     _orc_log(
                         lf_run,
                         f"стадия {stage_idx}: попытка {retry_idx} провалена ({stage_retries - retry_idx - 1} попытки остаются или конец retry).",
                         stderr_too=True,
                     )
+
+                _orc_log(lf_run, f"видеокадры сохранены в {adir.resolve()}/")
+                _lf_flush(lf_run)
+
+                _em = env.get_ep_meta()
+                am = {
+                    "stage_idx": stage_idx,
+                    "retry_idx": retry_idx,
+                    "attempt_seed": attempt_seed,
+                    "success": bool(success),
+                    "episode_length": int(ep_len),
+                    "attempt_dir": str(adir.relative_to(run_dir)),
+                    "instruction_lang": task_description,
+                    "layout_id": _em.get("layout_id"),
+                    "style_id": _em.get("style_id"),
+                    "horizon_name": horizon_name,
+                }
+                (adir / "attempt_meta.json").write_text(json.dumps(am, indent=2))
+                attempt_metas.append(am)
+
+                if success:
+                    break
 
             stage_records.append({"stage_idx": stage_idx, "succeeded": succeeded, "attempts": attempt_metas})
             _orc_log(lf_run, f"итог стадии {stage_idx} ({horizon_name}): success={succeeded}", stderr_too=True)
@@ -870,6 +941,12 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
                     full_task = "partial_run_through_last_success_stage"
                 else:
                     full_task = "partial_run_last_attempt_only"
+                n_st0 = len(stitch_primary)
+                if run_rollout_captions and len(run_rollout_captions) == n_st0:
+                    stitch_frame_caps = run_rollout_captions
+                else:
+                    _ft = full_task.replace("_", " ")[:88]
+                    stitch_frame_caps = [_ft] * n_st0
                 save_rollout_video(
                     stitch_primary,
                     stitch_secondary,
@@ -879,6 +956,7 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
                     task_description=full_task,
                     rollout_data_dir=str(run_dir),
                     log_file=lf_run,
+                    frame_captions=stitch_frame_caps,
                 )
                 _orc_log(
                     lf_run,
@@ -907,6 +985,7 @@ def main_with_cfg(cfg: PolicyEvalConfig) -> int:
                             show_diff=False,
                             log_file=lf_run,
                             show_timestep=True,
+                            frame_captions=stitch_frame_caps,
                         )
                         _orc_log(
                             lf_run,

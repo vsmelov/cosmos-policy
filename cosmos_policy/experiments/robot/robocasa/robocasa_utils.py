@@ -54,6 +54,35 @@ def _resize_uint8_hwc(img: np.ndarray, target_w: int, target_h: int) -> np.ndarr
     return np.asarray(pil_img)
 
 
+def _overlay_frame_caption_top_right(img: np.ndarray, caption: str, font_px: int = 12) -> np.ndarray:
+    """Dark label top-right on RGB uint8 HWC (in-place safe: returns new array)."""
+    pil = Image.fromarray(np.asarray(img, dtype=np.uint8, order="C"))
+    draw = ImageDraw.Draw(pil)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", font_px)
+    except OSError:
+        try:
+            font = ImageFont.truetype("DejaVuSansMono.ttf", font_px)
+        except OSError:
+            font = ImageFont.load_default()
+    text = (caption or "").replace("\n", " ").strip()
+    if len(text) > 110:
+        text = text[:107] + "..."
+    if not text:
+        return np.asarray(pil)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    w, h = pil.size
+    pad = 4
+    bx0 = max(0, w - tw - pad * 3)
+    by0 = pad
+    bx1 = w - pad
+    by1 = by0 + th + pad * 2
+    draw.rectangle((bx0, by0, bx1, by1), fill=(0, 0, 0))
+    draw.text((bx0 + pad, by0 + pad), text, font=font, fill=(255, 255, 255))
+    return np.asarray(pil)
+
+
 def save_rollout_video(
     rollout_primary_images,
     rollout_secondary_images,
@@ -63,6 +92,7 @@ def save_rollout_video(
     task_description,
     rollout_data_dir,
     log_file=None,
+    frame_captions=None,
 ):
     """Saves an MP4 replay of an episode with all three camera views."""
     processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:40]
@@ -85,13 +115,18 @@ def save_rollout_video(
         panel_h, panel_w = 224, 224
 
     # Concatenate all three camera views horizontally: primary (left) | secondary | wrist.
-    for primary_img, secondary_img, wrist_img in zip(
-        rollout_primary_images, rollout_secondary_images, rollout_wrist_images
+    n_frames = len(rollout_primary_images)
+    if frame_captions is not None and len(frame_captions) != n_frames:
+        frame_captions = None
+    for i, (primary_img, secondary_img, wrist_img) in enumerate(
+        zip(rollout_primary_images, rollout_secondary_images, rollout_wrist_images)
     ):
         p = _resize_uint8_hwc(_numpy_image_to_uint8_hwc(primary_img), panel_w, panel_h)
         s = _resize_uint8_hwc(_numpy_image_to_uint8_hwc(secondary_img), panel_w, panel_h)
         w = _resize_uint8_hwc(_numpy_image_to_uint8_hwc(wrist_img), panel_w, panel_h)
         combined_img = np.ascontiguousarray(np.concatenate([p, s, w], axis=1))
+        if frame_captions is not None:
+            combined_img = _overlay_frame_caption_top_right(combined_img, str(frame_captions[i]))
         video_writer.append_data(combined_img)
 
     video_writer.close()
@@ -118,6 +153,7 @@ def save_rollout_video_with_future_image_predictions(
     log_file=None,
     show_timestep=False,
     timestep=0,
+    frame_captions=None,
 ):
     """Saves an MP4 replay of an episode with 2 rows and 3 columns:
     Top row: current wrist, current primary, current secondary images
@@ -168,6 +204,10 @@ def save_rollout_video_with_future_image_predictions(
     # Define column labels
     column_labels = ["wrist image", "primary image (left)", "secondary image (right)"]
 
+    n_frames_fut = len(rollout_primary_images)
+    if frame_captions is not None and len(frame_captions) != n_frames_fut:
+        frame_captions = None
+
     for i, (primary_img, secondary_img, wrist_img) in enumerate(
         zip(rollout_primary_images, rollout_secondary_images, rollout_wrist_images)
     ):
@@ -209,6 +249,9 @@ def save_rollout_video_with_future_image_predictions(
         combined_img[target_h:, :target_w, :] = future_wrist_img
         combined_img[target_h:, target_w : target_w * 2, :] = future_primary_img
         combined_img[target_h:, target_w * 2 : target_w * 3, :] = future_secondary_img
+
+        if frame_captions is not None:
+            combined_img = _overlay_frame_caption_top_right(combined_img, str(frame_captions[i]), font_px=11)
 
         # Create a blank area for text (white background)
         text_area = np.ones((text_height, target_w * 3, 3), dtype=np.uint8) * 255
